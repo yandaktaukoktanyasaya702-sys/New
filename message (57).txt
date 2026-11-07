@@ -1,0 +1,1052 @@
+-- UNSTABLE / bench edition 2.0
+-- Self-contained MC client UI. Right Shift toggles the menu.
+-- Embedded icon geometry: Lucide, ISC license; see LUCIDE-LICENSE.txt.
+-- Requires the same PlayerScripts.MC modules as the supplied script.
+local env = (getgenv and getgenv()) or _G
+local previous = env.UNSTABLE_SMP
+local inherited = type(env.UNSTABLE_SMP_CFG) == "table" and env.UNSTABLE_SMP_CFG or nil
+local inheritedBinds = type(previous) == "table" and type(previous.binds) == "table" and table.clone(previous.binds) or nil
+if type(previous) == "table" and type(previous.destroy) == "function" then
+    pcall(previous.destroy)
+end
+
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local player = Players.LocalPlayer
+assert(player, "UNSTABLE: run on the client")
+local scripts = player:WaitForChild("PlayerScripts", 10)
+local MC = scripts and scripts:WaitForChild("MC", 10)
+assert(MC, "UNSTABLE: PlayerScripts.MC was not found")
+local function module(name)
+    local source = MC:WaitForChild(name, 10)
+    assert(source, "UNSTABLE: missing MC." .. name)
+    return require(source)
+end
+local Net, Hands, Controller, World = module("Net"), module("Hands"), module("Controller"), module("World")
+assert(type(Net.send) == "function" and type(World.targets) == "function", "UNSTABLE: unsupported MC interface")
+
+local defaults = {
+    killaura = false, autoTotem = false, camLock = false, silentAim = false, esp = false,
+    range = 3.5, attackInterval = 0.08, auraFov = 360, totemHealth = 8,
+    camSmooth = 8, aimRange = 24, aimFov = 140, aimHold = true, aimSticky = true,
+    prediction = 0.04, aimPart = "Chest", showFov = true,
+    silentChance = 100, silentRange = 3.5,
+    espRange = 100, espLimit = 32, espHz = 30, scanHz = 20,
+    espBoxes = true, espNames = true, espDistance = true, espHealth = true,
+    espTracers = false, espCorners = true, espFade = true,
+    theme = "Amethyst", uiScale = 1, watermark = true, moduleList = true,
+    pauseOnMenu = true,
+}
+local limits = {
+    range = {1, 6}, attackInterval = {0.05, 0.5}, auraFov = {30, 360}, totemHealth = {1, 20},
+    camSmooth = {1, 20}, aimRange = {2, 100}, aimFov = {30, 400}, prediction = {0, 0.2},
+    silentChance = {0, 100}, silentRange = {1, 6}, espRange = {10, 300},
+    espLimit = {4, 64}, espHz = {10, 60}, scanHz = {5, 30}, uiScale = {0.7, 1.2},
+}
+local themes = {
+    Amethyst = {accent = "A895FF", bg = "111117", panel = "191920", card = "22222C", text = "F2EFFA", muted = "9793AC", line = "34313F"},
+    Mint = {accent = "79DEBC", bg = "101715", panel = "17201D", card = "202B27", text = "ECF7F1", muted = "8EA99E", line = "304039"},
+    Glacier = {accent = "82C9F5", bg = "10151C", panel = "17202B", card = "202D3B", text = "EDF5FF", muted = "91A5BF", line = "314154"},
+    Rose = {accent = "F49AB7", bg = "191217", panel = "231A21", card = "30232D", text = "FFF0F5", muted = "B599A8", line = "463140"},
+    Ember = {accent = "F9B278", bg = "181411", panel = "231D18", card = "302820", text = "FFF4E9", muted = "B6A18D", line = "44372B"},
+    Graphite = {accent = "D9DEE9", bg = "131416", panel = "1B1D20", card = "25282C", text = "F2F4F8", muted = "9B9FA8", line = "383C43"},
+}
+local CFG = table.clone(defaults)
+local binds = {menu = "RightShift", killaura = "K", autoTotem = "T", camLock = "B", silentAim = "N", esp = "V"}
+local bindDefaults = table.clone(binds)
+local function validKey(name)
+    if type(name) ~= "string" or name == "Unknown" then return false end
+    local ok, value = pcall(function() return Enum.KeyCode[name] end)
+    return ok and value ~= nil
+end
+if inheritedBinds then
+    local used = {}
+    for _, key in ipairs({"menu", "killaura", "autoTotem", "camLock", "silentAim", "esp"}) do
+        local name = inheritedBinds[key]
+        if validKey(name) and not used[name] then binds[key], used[name] = name, true
+        elseif key ~= "menu" then binds[key] = "None"
+        else used[binds.menu] = true end
+    end
+end
+local function mergeSettings(data)
+    if type(data) ~= "table" then return end
+    for key, base in pairs(defaults) do
+        local value = data[key]
+        if type(value) == type(base) then
+            if type(value) == "number" then
+                if value == value and math.abs(value) < math.huge then
+                    CFG[key] = math.clamp(value, limits[key][1], limits[key][2])
+                end
+            elseif key == "theme" then
+                if themes[value] then CFG[key] = value end
+            elseif key == "aimPart" then
+                if value == "Head" or value == "Chest" then CFG[key] = value end
+            else CFG[key] = value end
+        end
+    end
+end
+mergeSettings(inherited)
+env.UNSTABLE_SMP_CFG = CFG
+
+local alive, connections, refreshers = true, {}, {}
+local api = {cfg = CFG, binds = binds, version = "2.0"}
+local cache, candidates, count = {}, {}, 0
+local aimTarget, auraTarget, silentTarget
+local menuOpen, typing, rightHeld = true, UIS:GetFocusedTextBox() ~= nil, false
+local lastScan, scanCost, espCost, lastError = 0, 0, 0, ""
+local theme, scale, window, status, toast, pages, navButtons
+local capture, sliderDrag, windowDrag
+local destroyed, setOption, selectTab, syncSilent
+local originalSend, wrappedSend
+local totTransaction, lastTotem, lastAttack = nil, 0, 0
+local CAMERA_BIND = "UNSTABLE_SMP_CAMERA_V2"
+local function track(connection)
+    connections[#connections + 1] = connection
+    return connection
+end
+local function listen(signal, fn) return track(signal:Connect(fn)) end
+local function finite(n) return type(n) == "number" and n == n and math.abs(n) < math.huge end
+local function vector(v) return typeof(v) == "Vector3" and finite(v.X) and finite(v.Y) and finite(v.Z) end
+local function report(message)
+    lastError = tostring(message)
+    if toast then toast.Text = lastError; toast.Visible = true; toast:SetAttribute("Expires", os.clock() + 4) end
+end
+local function refreshAll()
+    for _, fn in ipairs(refreshers) do fn() end
+end
+local function observer(fn) refreshers[#refreshers + 1] = fn; fn() end
+local function color(hex) return Color3.fromHex(hex) end
+local themed = {}
+local function bindColor(object, property, key)
+    themed[#themed + 1] = {object, property, key}
+    if theme then object[property] = theme[key] end
+end
+local function make(className, props, parent)
+    local object = Instance.new(className)
+    if object:IsA("GuiObject") then object.BorderSizePixel = 0 end
+    for key, value in pairs(props or {}) do object[key] = value end
+    object.Parent = parent
+    return object
+end
+local function round(object, radius) make("UICorner", {CornerRadius = UDim.new(0, radius or 8)}, object) end
+local function outline(object, key)
+    local stroke = make("UIStroke", {Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border}, object)
+    bindColor(stroke, "Color", key or "line")
+    return stroke
+end
+local function label(parent, text, size, position, dims, token, font)
+    local item = make("TextLabel", {BackgroundTransparency = 1, Text = text, TextSize = size or 13,
+        Font = font or Enum.Font.Gotham, TextXAlignment = Enum.TextXAlignment.Left,
+        Position = position or UDim2.new(), Size = dims or UDim2.fromScale(1, 1)}, parent)
+    bindColor(item, "TextColor3", token or "text")
+    return item
+end
+local function button(parent, text, position, dims)
+    local item = make("TextButton", {Text = text, AutoButtonColor = false, TextSize = 12,
+        Font = Enum.Font.GothamMedium, Position = position or UDim2.new(), Size = dims or UDim2.fromScale(1, 1)}, parent)
+    round(item, 6)
+    bindColor(item, "BackgroundColor3", "card"); bindColor(item, "TextColor3", "text")
+    return item
+end
+local function applyTheme()
+    theme = {}
+    for key, value in pairs(themes[CFG.theme]) do theme[key] = color(value) end
+    for _, binding in ipairs(themed) do
+        if binding[1].Parent then binding[1][binding[2]] = theme[binding[3]] end
+    end
+    refreshAll()
+end
+
+-- ICON_GEOMETRY (generated from the official Lucide SVGs; no runtime download).
+local ICONS = {
+["check"] = {{20.000,6.000,9.000,17.000},{9.000,17.000,4.000,12.000}},
+["chevron-right"] = {{9.000,18.000,15.000,12.000},{15.000,12.000,9.000,6.000}},
+["circle"] = {{22.000,12.000,21.659,14.588},{21.659,14.588,20.660,17.000},{20.660,17.000,19.071,19.071},{19.071,19.071,17.000,20.660},{17.000,20.660,14.588,21.659},{14.588,21.659,12.000,22.000},{12.000,22.000,9.412,21.659},{9.412,21.659,7.000,20.660},{7.000,20.660,4.929,19.071},{4.929,19.071,3.340,17.000},{3.340,17.000,2.341,14.588},{2.341,14.588,2.000,12.000},{2.000,12.000,2.341,9.412},{2.341,9.412,3.340,7.000},{3.340,7.000,4.929,4.929},{4.929,4.929,7.000,3.340},{7.000,3.340,9.412,2.341},{9.412,2.341,12.000,2.000},{12.000,2.000,14.588,2.341},{14.588,2.341,17.000,3.340},{17.000,3.340,19.071,4.929},{19.071,4.929,20.660,7.000},{20.660,7.000,21.659,9.412},{21.659,9.412,22.000,12.000}},
+["crosshair"] = {{22.000,12.000,21.659,14.588},{21.659,14.588,20.660,17.000},{20.660,17.000,19.071,19.071},{19.071,19.071,17.000,20.660},{17.000,20.660,14.588,21.659},{14.588,21.659,12.000,22.000},{12.000,22.000,9.412,21.659},{9.412,21.659,7.000,20.660},{7.000,20.660,4.929,19.071},{4.929,19.071,3.340,17.000},{3.340,17.000,2.341,14.588},{2.341,14.588,2.000,12.000},{2.000,12.000,2.341,9.412},{2.341,9.412,3.340,7.000},{3.340,7.000,4.929,4.929},{4.929,4.929,7.000,3.340},{7.000,3.340,9.412,2.341},{9.412,2.341,12.000,2.000},{12.000,2.000,14.588,2.341},{14.588,2.341,17.000,3.340},{17.000,3.340,19.071,4.929},{19.071,4.929,20.660,7.000},{20.660,7.000,21.659,9.412},{21.659,9.412,22.000,12.000},{22.000,12.000,18.000,12.000},{6.000,12.000,2.000,12.000},{12.000,6.000,12.000,2.000},{12.000,22.000,12.000,18.000}},
+["eye"] = {{2.062,12.348,2.007,12.118},{2.007,12.118,2.007,11.882},{2.007,11.882,2.062,11.652},{2.062,11.652,2.965,9.926},{2.965,9.926,4.165,8.391},{4.165,8.391,5.622,7.097},{5.622,7.097,7.288,6.088},{7.288,6.088,9.110,5.396},{9.110,5.396,11.026,5.045},{11.026,5.045,12.974,5.045},{12.974,5.045,14.890,5.396},{14.890,5.396,16.712,6.088},{16.712,6.088,18.378,7.097},{18.378,7.097,19.835,8.391},{19.835,8.391,21.035,9.926},{21.035,9.926,21.938,11.652},{21.938,11.652,21.993,11.882},{21.993,11.882,21.993,12.118},{21.993,12.118,21.938,12.348},{21.938,12.348,21.035,14.074},{21.035,14.074,19.835,15.609},{19.835,15.609,18.378,16.903},{18.378,16.903,16.712,17.912},{16.712,17.912,14.890,18.604},{14.890,18.604,12.974,18.955},{12.974,18.955,11.026,18.955},{11.026,18.955,9.110,18.604},{9.110,18.604,7.288,17.912},{7.288,17.912,5.622,16.903},{5.622,16.903,4.165,15.609},{4.165,15.609,2.965,14.074},{2.965,14.074,2.062,12.348},{15.000,12.000,14.898,12.776},{14.898,12.776,14.598,13.500},{14.598,13.500,14.121,14.121},{14.121,14.121,13.500,14.598},{13.500,14.598,12.776,14.898},{12.776,14.898,12.000,15.000},{12.000,15.000,11.224,14.898},{11.224,14.898,10.500,14.598},{10.500,14.598,9.879,14.121},{9.879,14.121,9.402,13.500},{9.402,13.500,9.102,12.776},{9.102,12.776,9.000,12.000},{9.000,12.000,9.102,11.224},{9.102,11.224,9.402,10.500},{9.402,10.500,9.879,9.879},{9.879,9.879,10.500,9.402},{10.500,9.402,11.224,9.102},{11.224,9.102,12.000,9.000},{12.000,9.000,12.776,9.102},{12.776,9.102,13.500,9.402},{13.500,9.402,14.121,9.879},{14.121,9.879,14.598,10.500},{14.598,10.500,14.898,11.224},{14.898,11.224,15.000,12.000}},
+["keyboard"] = {{16.000,12.000,16.010,12.000},{18.000,8.000,18.010,8.000},{7.000,16.000,17.000,16.000},{2.000,4.000,22.000,4.000},{22.000,4.000,22.000,20.000},{22.000,20.000,2.000,20.000},{2.000,20.000,2.000,4.000}},
+["mouse-pointer-2"] = {{4.037,4.688,4.033,4.304},{4.033,4.304,4.304,4.033},{4.304,4.033,4.688,4.037},{4.688,4.037,20.688,10.537},{20.688,10.537,20.969,10.828},{20.969,10.828,20.942,11.232},{20.942,11.232,20.625,11.484},{20.625,11.484,14.501,13.064},{14.501,13.064,13.859,13.358},{13.859,13.358,13.358,13.857},{13.358,13.857,13.063,14.499},{13.063,14.499,11.484,20.625},{11.484,20.625,11.232,20.942},{11.232,20.942,10.828,20.969},{10.828,20.969,10.537,20.688},{10.537,20.688,4.037,4.688}},
+["palette"] = {{12.000,22.000,10.049,21.808},{10.049,21.808,8.173,21.239},{8.173,21.239,6.444,20.315},{6.444,20.315,4.929,19.071},{4.929,19.071,3.685,17.556},{3.685,17.556,2.761,15.827},{2.761,15.827,2.192,13.951},{2.192,13.951,2.000,12.000},{2.000,12.000,2.192,10.049},{2.192,10.049,2.761,8.173},{2.761,8.173,3.685,6.444},{3.685,6.444,4.929,4.929},{4.929,4.929,6.444,3.685},{6.444,3.685,8.173,2.761},{8.173,2.761,10.049,2.192},{10.049,2.192,12.000,2.000},{12.000,2.000,13.951,2.173},{13.951,2.173,15.827,2.685},{15.827,2.685,17.556,3.517},{17.556,3.517,19.071,4.636},{19.071,4.636,20.315,6.000},{20.315,6.000,21.239,7.556},{21.239,7.556,21.808,9.244},{21.808,9.244,22.000,11.000},{22.000,11.000,21.619,12.913},{21.619,12.913,20.536,14.536},{20.536,14.536,18.913,15.619},{18.913,15.619,17.000,16.000},{17.000,16.000,14.750,16.000},{14.750,16.000,13.572,16.455},{13.572,16.455,13.008,17.585},{13.008,17.585,13.350,18.800},{13.350,18.800,13.650,19.200},{13.650,19.200,13.992,20.415},{13.992,20.415,13.428,21.545},{13.428,21.545,12.250,22.000},{12.250,22.000,12.000,22.000},{14.000,6.500,13.983,6.629},{13.983,6.629,13.933,6.750},{13.933,6.750,13.854,6.854},{13.854,6.854,13.750,6.933},{13.750,6.933,13.629,6.983},{13.629,6.983,13.500,7.000},{13.500,7.000,13.371,6.983},{13.371,6.983,13.250,6.933},{13.250,6.933,13.146,6.854},{13.146,6.854,13.067,6.750},{13.067,6.750,13.017,6.629},{13.017,6.629,13.000,6.500},{13.000,6.500,13.017,6.371},{13.017,6.371,13.067,6.250},{13.067,6.250,13.146,6.146},{13.146,6.146,13.250,6.067},{13.250,6.067,13.371,6.017},{13.371,6.017,13.500,6.000},{13.500,6.000,13.629,6.017},{13.629,6.017,13.750,6.067},{13.750,6.067,13.854,6.146},{13.854,6.146,13.933,6.250},{13.933,6.250,13.983,6.371},{13.983,6.371,14.000,6.500},{18.000,10.500,17.983,10.629},{17.983,10.629,17.933,10.750},{17.933,10.750,17.854,10.854},{17.854,10.854,17.750,10.933},{17.750,10.933,17.629,10.983},{17.629,10.983,17.500,11.000},{17.500,11.000,17.371,10.983},{17.371,10.983,17.250,10.933},{17.250,10.933,17.146,10.854},{17.146,10.854,17.067,10.750},{17.067,10.750,17.017,10.629},{17.017,10.629,17.000,10.500},{17.000,10.500,17.017,10.371},{17.017,10.371,17.067,10.250},{17.067,10.250,17.146,10.146},{17.146,10.146,17.250,10.067},{17.250,10.067,17.371,10.017},{17.371,10.017,17.500,10.000},{17.500,10.000,17.629,10.017},{17.629,10.017,17.750,10.067},{17.750,10.067,17.854,10.146},{17.854,10.146,17.933,10.250},{17.933,10.250,17.983,10.371},{17.983,10.371,18.000,10.500},{7.000,12.500,6.983,12.629},{6.983,12.629,6.933,12.750},{6.933,12.750,6.854,12.854},{6.854,12.854,6.750,12.933},{6.750,12.933,6.629,12.983},{6.629,12.983,6.500,13.000},{6.500,13.000,6.371,12.983},{6.371,12.983,6.250,12.933},{6.250,12.933,6.146,12.854},{6.146,12.854,6.067,12.750},{6.067,12.750,6.017,12.629},{6.017,12.629,6.000,12.500},{6.000,12.500,6.017,12.371},{6.017,12.371,6.067,12.250},{6.067,12.250,6.146,12.146},{6.146,12.146,6.250,12.067},{6.250,12.067,6.371,12.017},{6.371,12.017,6.500,12.000},{6.500,12.000,6.629,12.017},{6.629,12.017,6.750,12.067},{6.750,12.067,6.854,12.146},{6.854,12.146,6.933,12.250},{6.933,12.250,6.983,12.371},{6.983,12.371,7.000,12.500},{9.000,7.500,8.983,7.629},{8.983,7.629,8.933,7.750},{8.933,7.750,8.854,7.854},{8.854,7.854,8.750,7.933},{8.750,7.933,8.629,7.983},{8.629,7.983,8.500,8.000},{8.500,8.000,8.371,7.983},{8.371,7.983,8.250,7.933},{8.250,7.933,8.146,7.854},{8.146,7.854,8.067,7.750},{8.067,7.750,8.017,7.629},{8.017,7.629,8.000,7.500},{8.000,7.500,8.017,7.371},{8.017,7.371,8.067,7.250},{8.067,7.250,8.146,7.146},{8.146,7.146,8.250,7.067},{8.250,7.067,8.371,7.017},{8.371,7.017,8.500,7.000},{8.500,7.000,8.629,7.017},{8.629,7.017,8.750,7.067},{8.750,7.067,8.854,7.146},{8.854,7.146,8.933,7.250},{8.933,7.250,8.983,7.371},{8.983,7.371,9.000,7.500}},
+["power"] = {{12.000,2.000,12.000,12.000},{18.400,6.600,19.606,8.096},{19.606,8.096,20.466,9.814},{20.466,9.814,20.942,11.676},{20.942,11.676,21.013,13.596},{21.013,13.596,20.674,15.487},{20.674,15.487,19.941,17.263},{19.941,17.263,18.848,18.843},{18.848,18.843,17.444,20.156},{17.444,20.156,15.794,21.140},{15.794,21.140,13.973,21.752},{13.973,21.752,12.063,21.963},{12.063,21.963,10.152,21.764},{10.152,21.764,8.327,21.163},{8.327,21.163,6.670,20.189},{6.670,20.189,5.259,18.886},{5.259,18.886,4.156,17.313},{4.156,17.313,3.412,15.541},{3.412,15.541,3.061,13.652},{3.061,13.652,3.120,11.731},{3.120,11.731,3.584,9.867},{3.584,9.867,4.434,8.144},{4.434,8.144,5.630,6.640}},
+["search"] = {{21.000,21.000,16.660,16.660},{19.000,11.000,18.727,13.071},{18.727,13.071,17.928,15.000},{17.928,15.000,16.657,16.657},{16.657,16.657,15.000,17.928},{15.000,17.928,13.071,18.727},{13.071,18.727,11.000,19.000},{11.000,19.000,8.929,18.727},{8.929,18.727,7.000,17.928},{7.000,17.928,5.343,16.657},{5.343,16.657,4.072,15.000},{4.072,15.000,3.273,13.071},{3.273,13.071,3.000,11.000},{3.000,11.000,3.273,8.929},{3.273,8.929,4.072,7.000},{4.072,7.000,5.343,5.343},{5.343,5.343,7.000,4.072},{7.000,4.072,8.929,3.273},{8.929,3.273,11.000,3.000},{11.000,3.000,13.071,3.273},{13.071,3.273,15.000,4.072},{15.000,4.072,16.657,5.343},{16.657,5.343,17.928,7.000},{17.928,7.000,18.727,8.929},{18.727,8.929,19.000,11.000}},
+["settings-2"] = {{14.000,17.000,5.000,17.000},{19.000,7.000,10.000,7.000},{20.000,17.000,19.898,17.776},{19.898,17.776,19.598,18.500},{19.598,18.500,19.121,19.121},{19.121,19.121,18.500,19.598},{18.500,19.598,17.776,19.898},{17.776,19.898,17.000,20.000},{17.000,20.000,16.224,19.898},{16.224,19.898,15.500,19.598},{15.500,19.598,14.879,19.121},{14.879,19.121,14.402,18.500},{14.402,18.500,14.102,17.776},{14.102,17.776,14.000,17.000},{14.000,17.000,14.102,16.224},{14.102,16.224,14.402,15.500},{14.402,15.500,14.879,14.879},{14.879,14.879,15.500,14.402},{15.500,14.402,16.224,14.102},{16.224,14.102,17.000,14.000},{17.000,14.000,17.776,14.102},{17.776,14.102,18.500,14.402},{18.500,14.402,19.121,14.879},{19.121,14.879,19.598,15.500},{19.598,15.500,19.898,16.224},{19.898,16.224,20.000,17.000},{10.000,7.000,9.898,7.776},{9.898,7.776,9.598,8.500},{9.598,8.500,9.121,9.121},{9.121,9.121,8.500,9.598},{8.500,9.598,7.776,9.898},{7.776,9.898,7.000,10.000},{7.000,10.000,6.224,9.898},{6.224,9.898,5.500,9.598},{5.500,9.598,4.879,9.121},{4.879,9.121,4.402,8.500},{4.402,8.500,4.102,7.776},{4.102,7.776,4.000,7.000},{4.000,7.000,4.102,6.224},{4.102,6.224,4.402,5.500},{4.402,5.500,4.879,4.879},{4.879,4.879,5.500,4.402},{5.500,4.402,6.224,4.102},{6.224,4.102,7.000,4.000},{7.000,4.000,7.776,4.102},{7.776,4.102,8.500,4.402},{8.500,4.402,9.121,4.879},{9.121,4.879,9.598,5.500},{9.598,5.500,9.898,6.224},{9.898,6.224,10.000,7.000}},
+["shield"] = {{20.000,13.000,19.794,14.994},{19.794,14.994,19.209,16.707},{19.209,16.707,18.295,18.165},{18.295,18.165,17.101,19.393},{17.101,19.393,15.678,20.416},{15.678,20.416,14.074,21.260},{14.074,21.260,12.340,21.950},{12.340,21.950,12.118,21.998},{12.118,21.998,11.891,21.995},{11.891,21.995,11.670,21.940},{11.670,21.940,9.932,21.254},{9.932,21.254,8.326,20.413},{8.326,20.413,6.901,19.391},{6.901,19.391,5.706,18.164},{5.706,18.164,4.791,16.707},{4.791,16.707,4.206,14.994},{4.206,14.994,4.000,13.000},{4.000,13.000,4.000,6.000},{4.000,6.000,4.134,5.500},{4.134,5.500,4.500,5.134},{4.500,5.134,5.000,5.000},{5.000,5.000,6.574,4.789},{6.574,4.789,8.218,4.210},{8.218,4.210,9.812,3.346},{9.812,3.346,11.240,2.280},{11.240,2.280,11.727,2.032},{11.727,2.032,12.273,2.032},{12.273,2.032,12.760,2.280},{12.760,2.280,14.192,3.350},{14.192,3.350,15.786,4.214},{15.786,4.214,17.427,4.790},{17.427,4.790,19.000,5.000},{19.000,5.000,19.500,5.134},{19.500,5.134,19.866,5.500},{19.866,5.500,20.000,6.000},{20.000,6.000,20.000,13.000}},
+["swords"] = {{13.000,19.000,19.000,13.000},{14.500,17.500,3.586,6.586},{3.586,6.586,3.268,6.172},{3.268,6.172,3.068,5.690},{3.068,5.690,3.000,5.172},{3.000,5.172,3.000,3.000},{3.000,3.000,5.172,3.000},{5.172,3.000,5.690,3.068},{5.690,3.068,6.172,3.268},{6.172,3.268,6.586,3.586},{6.586,3.586,17.500,14.500},{14.828,6.172,17.414,3.586},{17.414,3.586,17.828,3.268},{17.828,3.268,18.310,3.068},{18.310,3.068,18.828,3.000},{18.828,3.000,21.000,3.000},{21.000,3.000,21.000,5.172},{21.000,5.172,20.932,5.690},{20.932,5.690,20.732,6.172},{20.732,6.172,20.414,6.586},{20.414,6.586,17.828,9.172},{16.000,16.000,20.000,20.000},{19.000,21.000,21.000,19.000},{5.000,14.000,9.000,18.000},{5.000,21.000,3.000,19.000},{7.500,16.500,4.000,20.000}},
+["x"] = {{18.000,6.000,6.000,18.000},{6.000,6.000,18.000,18.000}},
+["zap"] = {{15.914,4.000,15.771,2.705},{15.771,2.705,14.670,2.011},{14.670,2.011,13.440,2.439},{13.440,2.439,4.440,11.439},{4.440,11.439,4.000,12.500},{4.000,12.500,4.439,13.560},{4.439,13.560,5.500,14.000},{5.500,14.000,9.502,14.000},{9.502,14.000,9.799,14.098},{9.799,14.098,9.979,14.353},{9.979,14.353,9.973,14.666},{9.973,14.666,8.086,20.000},{8.086,20.000,8.229,21.295},{8.229,21.295,9.331,21.990},{9.331,21.990,10.561,21.560},{10.561,21.560,19.561,12.560},{19.561,12.560,20.000,11.499},{20.000,11.499,19.560,10.439},{19.560,10.439,18.500,10.000},{18.500,10.000,14.503,10.000},{14.503,10.000,14.205,9.902},{14.205,9.902,14.024,9.646},{14.024,9.646,14.031,9.333},{14.031,9.333,15.914,4.000}}
+}
+-- END_ICON_GEOMETRY
+local function icon(parent, name, x, y, size, token)
+    local container = make("Frame", {Name = name, BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(x, y), Size = UDim2.fromOffset(size, size)}, parent)
+    for _, segment in ipairs(ICONS[name] or {}) do
+        local dx, dy = segment[3] - segment[1], segment[4] - segment[2]
+        local line = make("Frame", {AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale((segment[1] + segment[3]) / 48, (segment[2] + segment[4]) / 48),
+            Size = UDim2.fromOffset(math.sqrt(dx * dx + dy * dy) * size / 24 + 0.6, math.max(1.2, size / 13)),
+            Rotation = math.deg(math.atan2(dy, dx))}, container)
+        round(line, 3); bindColor(line, "BackgroundColor3", token or "muted")
+    end
+    return container
+end
+
+local gui = make("ScreenGui", {Name = "UNSTABLE_SMP", ResetOnSpawn = false,
+    IgnoreGuiInset = true, DisplayOrder = 999999, ZIndexBehavior = Enum.ZIndexBehavior.Sibling},
+    player:WaitForChild("PlayerGui"))
+local espLayer = make("Frame", {Name = "ESP", Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1}, gui)
+local fov = make("Frame", {Name = "AimFOV", AnchorPoint = Vector2.new(0.5, 0.5), BackgroundTransparency = 1, Visible = false}, gui)
+round(fov, 9999)
+local fovStroke = outline(fov, "accent"); fovStroke.Transparency = 0.45
+local mark = button(gui, "", UDim2.fromOffset(20, 20), UDim2.fromOffset(212, 35))
+bindColor(mark, "BackgroundColor3", "panel"); outline(mark)
+icon(mark, "zap", 10, 9, 17, "accent")
+label(mark, "UNSTABLE", 12, UDim2.fromOffset(35, 0), UDim2.new(0, 86, 1, 0), "text", Enum.Font.GothamBold)
+local markStat = label(mark, "bench / 2.0", 10, UDim2.fromOffset(123, 0), UDim2.new(1, -130, 1, 0), "muted")
+local activeList = label(gui, "", 12, UDim2.new(1, -220, 0, 24), UDim2.fromOffset(200, 180), "accent", Enum.Font.GothamMedium)
+activeList.TextXAlignment = Enum.TextXAlignment.Right; activeList.TextYAlignment = Enum.TextYAlignment.Top
+
+window = make("Frame", {Name = "Main", Size = UDim2.fromOffset(900, 596),
+    Position = UDim2.new(0.5, -450, 0.5, -298), Active = true, ClipsDescendants = true}, gui)
+round(window, 12); bindColor(window, "BackgroundColor3", "bg"); outline(window)
+scale = make("UIScale", {Scale = CFG.uiScale}, window)
+local sidebar = make("Frame", {Size = UDim2.new(0, 178, 1, 0)}, window)
+bindColor(sidebar, "BackgroundColor3", "panel")
+icon(sidebar, "zap", 19, 23, 25, "accent")
+label(sidebar, "UNSTABLE", 16, UDim2.fromOffset(52, 19), UDim2.fromOffset(122, 25), "text", Enum.Font.GothamBold)
+label(sidebar, "SMP  /  BENCH EDITION", 9, UDim2.fromOffset(20, 59), UDim2.fromOffset(154, 15), "muted")
+label(sidebar, "WORKSPACE", 9, UDim2.fromOffset(20, 105), UDim2.fromOffset(146, 16), "muted", Enum.Font.GothamBold)
+label(sidebar, "@oll.fx", 11, UDim2.new(0, 20, 1, -59), UDim2.fromOffset(145, 19), "text", Enum.Font.GothamMedium)
+local menuHint = label(sidebar, "RSHIFT  /  TOGGLE MENU", 9, UDim2.new(0, 20, 1, -35), UDim2.fromOffset(150, 17), "muted")
+local top = make("TextButton", {Text = "", Modal = true, AutoButtonColor = false, BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(178, 0), Size = UDim2.new(1, -222, 0, 92)}, window)
+local heading = label(top, "Combat", 25, UDim2.fromOffset(25, 19), UDim2.fromOffset(280, 33), "text", Enum.Font.GothamBold)
+local subtitle = label(top, "Targeting, timing, and camera control.", 11, UDim2.fromOffset(26, 56), UDim2.fromOffset(500, 18), "muted")
+local close = button(window, "", UDim2.new(1, -40, 0, 20), UDim2.fromOffset(26, 26))
+icon(close, "x", 5, 5, 16)
+local content = make("Frame", {Name = "Content", BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(202, 97), Size = UDim2.new(1, -226, 1, -145)}, window)
+pages, navButtons = {}, {}
+local tabInfo = {
+    {"Combat", "swords", "Targeting, timing, and camera control."},
+    {"Visuals", "eye", "Useful information. A controlled rendering budget."},
+    {"Utility", "shield", "Inventory helpers and runtime controls."},
+    {"Themes", "palette", "Make the workspace yours."},
+    {"Keybinds", "keyboard", "Click a binding, then press a key."},
+    {"Settings", "settings-2", "Performance, profiles, and session settings."},
+}
+selectTab = function(name)
+    for _, item in ipairs(tabInfo) do
+        local selected = item[1] == name
+        pages[item[1]].Visible = selected
+        navButtons[item[1]].BackgroundTransparency = selected and 0 or 1
+        if selected then heading.Text = item[1]; subtitle.Text = item[3] end
+    end
+end
+for index, item in ipairs(tabInfo) do
+    local nav = button(sidebar, "", UDim2.fromOffset(10, 135 + (index - 1) * 46), UDim2.fromOffset(158, 38))
+    icon(nav, item[2], 12, 10, 18, "accent")
+    label(nav, item[1], 12, UDim2.fromOffset(42, 0), UDim2.new(1, -50, 1, 0), "text", Enum.Font.GothamMedium)
+    navButtons[item[1]] = nav
+    listen(nav.Activated, function() selectTab(item[1]) end)
+    local page = make("ScrollingFrame", {Name = item[1], Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+        ScrollBarThickness = 3, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        ScrollingDirection = Enum.ScrollingDirection.Y, Visible = false}, content)
+    bindColor(page, "ScrollBarImageColor3", "line")
+    make("UIPadding", {PaddingBottom = UDim.new(0, 12), PaddingRight = UDim.new(0, 7)}, page)
+    make("UIListLayout", {Padding = UDim.new(0, 12), SortOrder = Enum.SortOrder.LayoutOrder}, page)
+    pages[item[1]] = page
+end
+local rule = make("Frame", {Position = UDim2.new(0, 202, 1, -38), Size = UDim2.new(1, -226, 0, 1)}, window)
+bindColor(rule, "BackgroundColor3", "line")
+status = label(window, "Ready", 10, UDim2.new(0, 202, 1, -31), UDim2.new(1, -226, 0, 23), "muted", Enum.Font.Code)
+toast = label(gui, "", 12, UDim2.new(0.5, -240, 1, -63), UDim2.fromOffset(480, 39), "text")
+toast.TextXAlignment = Enum.TextXAlignment.Center; toast.BackgroundTransparency = 0; toast.Visible = false
+round(toast, 8); bindColor(toast, "BackgroundColor3", "panel"); outline(toast)
+
+local function card(page, title, description, glyph)
+    local outer = make("Frame", {Name = title, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y}, page)
+    round(outer, 8); outline(outer); bindColor(outer, "BackgroundColor3", "panel")
+    make("UIPadding", {PaddingTop = UDim.new(0, 14), PaddingBottom = UDim.new(0, 12),
+        PaddingLeft = UDim.new(0, 16), PaddingRight = UDim.new(0, 16)}, outer)
+    make("UIListLayout", {Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder}, outer)
+    local header = make("Frame", {BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 47)}, outer)
+    icon(header, glyph or "settings-2", 0, 2, 19, "accent")
+    label(header, title, 14, UDim2.fromOffset(29, 0), UDim2.new(1, -32, 0, 21), "text", Enum.Font.GothamBold)
+    label(header, description, 10, UDim2.fromOffset(29, 23), UDim2.new(1, -32, 0, 18), "muted")
+    return outer
+end
+local function row(parent, title, height)
+    local frame = make("Frame", {Name = title, Size = UDim2.new(1, 0, 0, height or 35), BackgroundTransparency = 1}, parent)
+    label(frame, title, 12, UDim2.new(), UDim2.new(0.55, 0, 1, 0))
+    return frame
+end
+local function toggle(parent, title, key)
+    local frame = row(parent, title)
+    local click = button(frame, "", UDim2.new(1, -42, 0.5, -10), UDim2.fromOffset(38, 20))
+    round(click, 999)
+    local knob = make("Frame", {Size = UDim2.fromOffset(14, 14), Position = UDim2.fromOffset(3, 3)}, click)
+    round(knob, 999); bindColor(knob, "BackgroundColor3", "text")
+    listen(click.Activated, function() setOption(key, not CFG[key]) end)
+    observer(function()
+        if theme then click.BackgroundColor3 = CFG[key] and theme.accent or theme.line end
+        knob.Position = UDim2.fromOffset(CFG[key] and 21 or 3, 3)
+    end)
+end
+local function slider(parent, title, key, minimum, maximum, step, format)
+    local frame = row(parent, title, 44)
+    local value = label(frame, "", 11, UDim2.new(1, -61, 0, 1), UDim2.fromOffset(59, 22), "accent", Enum.Font.Code)
+    value.TextXAlignment = Enum.TextXAlignment.Right
+    local hit = button(frame, "", UDim2.new(0.54, 0, 0, 24), UDim2.new(0.46, -3, 0, 16))
+    hit.BackgroundTransparency = 1
+    local rail = make("Frame", {Position = UDim2.new(0, 0, 0.5, -2), Size = UDim2.new(1, 0, 0, 4)}, hit)
+    round(rail, 5); bindColor(rail, "BackgroundColor3", "line")
+    local fill = make("Frame", {Size = UDim2.fromScale(0, 1)}, rail)
+    round(fill, 5); bindColor(fill, "BackgroundColor3", "accent")
+    local dot = make("Frame", {AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(9, 9), Position = UDim2.fromScale(1, 0.5)}, fill)
+    round(dot, 99); bindColor(dot, "BackgroundColor3", "text")
+    local function update(x)
+        local ratio = math.clamp((x - hit.AbsolutePosition.X) / math.max(1, hit.AbsoluteSize.X), 0, 1)
+        setOption(key, math.clamp(minimum + math.floor((maximum - minimum) * ratio / step + 0.5) * step, minimum, maximum))
+    end
+    listen(hit.InputBegan, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            sliderDrag = {update = update, input = input}; update(input.Position.X)
+        end
+    end)
+    observer(function()
+        value.Text = string.format(format or "%.0f", CFG[key])
+        fill.Size = UDim2.fromScale((CFG[key] - minimum) / (maximum - minimum), 1)
+    end)
+end
+local function choice(parent, title, key, values)
+    local frame = row(parent, title)
+    local control = button(frame, "", UDim2.new(1, -135, 0, 3), UDim2.fromOffset(132, 28))
+    listen(control.Activated, function()
+        local index = table.find(values, CFG[key]) or 1
+        setOption(key, values[index % #values + 1])
+    end)
+    observer(function() control.Text = tostring(CFG[key]) .. "  >" end)
+end
+local function action(parent, title, text, callback)
+    local frame = row(parent, title, 39)
+    local control = button(frame, text, UDim2.new(1, -135, 0, 3), UDim2.fromOffset(132, 30))
+    listen(control.Activated, callback)
+    return control
+end
+
+-- TARGET SERVICE: one bounded refresh, shared by all consumers.
+local function eyePosition()
+    local ok, eye = pcall(Controller.eye)
+    return ok and vector(eye) and eye or nil
+end
+local function playable()
+    local character = player.Character
+    return character ~= nil and character:GetAttribute("Alive") == true
+        and Controller.state ~= nil and not Controller.locked and not Controller.frozen
+end
+local function combatAllowed()
+    return alive and playable() and not typing and UIS:GetFocusedTextBox() == nil and not (menuOpen and CFG.pauseOnMenu)
+        and workspace:GetAttribute("JugHold") ~= true
+end
+local function cameraAllowed()
+    return combatAllowed() and (not CFG.aimHold or rightHeld)
+end
+local function aimPoint(record, predict)
+    local point = record.feet + Vector3.new(0, record.height * (CFG.aimPart == "Head" and 0.88 or 0.60), 0)
+    if predict then
+        local lead = record.velocity * CFG.prediction
+        if lead.Magnitude > 1.5 then lead = lead.Unit * 1.5 end
+        point = point + lead
+    end
+    return point
+end
+-- MC coordinates are projected relative to Controller.eye(). A uniform voxel
+-- scale cancels in perspective, so no guessed studs-per-block multiplier is used.
+local function project(camera, eye, point)
+    return camera:WorldToViewportPoint(camera.CFrame.Position + point - eye)
+end
+local function screenDistance(camera, eye, point)
+    local p, visible = project(camera, eye, point)
+    if not visible or p.Z <= 0.01 then return math.huge end
+    local viewport = camera.ViewportSize
+    local dx, dy = p.X - viewport.X * 0.5, p.Y - viewport.Y * 0.5
+    return math.sqrt(dx * dx + dy * dy)
+end
+local function usable(record, maxRange, now)
+    return record ~= nil and now - record.seen < 0.3 and record.distance <= maxRange
+        and (record.health == nil or record.health > 0)
+end
+local function snapshot(look)
+    local state = Controller.state
+    if not state or not vector(state.pos) then return nil end
+    return {fall = state.fallDistance or 0, ground = state.onGround == true,
+        sprint = state.sprinting == true, water = state.inWater == true, gliding = state.gliding == true,
+        vel = state.vel or Vector3.zero, look = look, swap = false, pos = state.pos, predicted = true}
+end
+local function readIdentity(target)
+    local entity = target.player
+    local name = target.displayName or target.name
+    local health = finite(target.health) and target.health or (finite(target.hp) and target.hp or nil)
+    local maxHealth = finite(target.maxHealth) and target.maxHealth or nil
+    if typeof(entity) == "Instance" and entity:IsA("Player") then
+        name = entity.DisplayName
+        local hp = entity:GetAttribute("Health")
+        if health == nil and finite(hp) then health = hp end
+        local max = entity:GetAttribute("MaxHealth")
+        if maxHealth == nil and finite(max) then maxHealth = max end
+    end
+    -- Missing health remains unknown. Never manufacture a full health bar.
+    return string.sub(tostring(name or target.id), 1, 32), health, maxHealth
+end
+local function scanTargets(now)
+    local started = os.clock()
+    lastScan = now
+    table.clear(candidates)
+    aimTarget, auraTarget, silentTarget = nil, nil, nil
+    if not (CFG.esp or CFG.camLock or CFG.killaura or CFG.silentAim) then
+        count = 0; table.clear(cache); scanCost = 0; return
+    end
+    local eye, camera = eyePosition(), workspace.CurrentCamera
+    if not eye or not camera then count = 0; return end
+    local ok, targets = pcall(World.targets)
+    if not ok or type(targets) ~= "table" then
+        count = 0; scanCost = (os.clock() - started) * 1000; return
+    end
+    local nearest, bestAim, bestSilent = math.huge, math.huge, math.huge
+    local previousId = api.targetId
+    local sticky
+    local inspected = 0
+    for _, target in pairs(targets) do
+        inspected = inspected + 1
+        if inspected > 512 then break end
+        if type(target) == "table" and (type(target.id) == "string" or finite(target.id)) and vector(target.feet) then
+            local record = cache[target.id]
+            local fresh = record == nil
+            if fresh then
+                record = {id = target.id, velocity = Vector3.zero, seen = now, feet = target.feet}
+                cache[target.id] = record
+            end
+            local elapsed = now - record.seen
+            if not fresh and elapsed >= 0.01 and elapsed <= 0.3 then
+                local velocity = (target.feet - record.feet) / elapsed
+                if velocity.Magnitude < 60 then
+                    record.velocity = record.velocity:Lerp(velocity, 0.4)
+                else record.velocity = Vector3.zero end
+            else record.velocity = Vector3.zero end
+            record.feet, record.seen = target.feet, now
+            record.height = finite(target.height) and math.clamp(target.height, 0.2, 8) or 1.8
+            record.width = finite(target.width) and math.clamp(target.width, 0.1, 4) or 0.6
+            record.name, record.health, record.maxHealth = readIdentity(target)
+            record.distance = (target.feet + Vector3.new(0, record.height * 0.5, 0) - eye).Magnitude
+            if record.health == nil or record.health > 0 then
+                candidates[#candidates + 1] = record
+                local point = aimPoint(record, false)
+                local delta = point - eye
+                local withinAngle = CFG.auraFov >= 360 or (delta.Magnitude > 0.001
+                    and camera.CFrame.LookVector:Dot(delta.Unit) >= math.cos(math.rad(CFG.auraFov * 0.5)))
+                if CFG.killaura and record.distance <= CFG.range and record.distance < nearest and withinAngle then
+                    auraTarget, nearest = record, record.distance
+                end
+                if (CFG.camLock and record.distance <= CFG.aimRange) or (CFG.silentAim and record.distance <= CFG.silentRange) then
+                    local distance = screenDistance(camera, eye, point)
+                    record.screenDistance = distance
+                    if distance <= CFG.aimFov then
+                        if CFG.camLock and record.distance <= CFG.aimRange then
+                            if record.id == previousId then sticky = record end
+                            if distance < bestAim then aimTarget, bestAim = record, distance end
+                        end
+                        if CFG.silentAim and record.distance <= CFG.silentRange and distance < bestSilent then
+                            silentTarget, bestSilent = record, distance
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if CFG.aimSticky and sticky and (not aimTarget or sticky.screenDistance <= bestAim + 30) then aimTarget = sticky end
+    api.targetId = aimTarget and aimTarget.id or nil
+    for id, record in pairs(cache) do
+        if record.seen ~= now then cache[id] = nil end
+    end
+    count = #candidates
+    if CFG.esp then table.sort(candidates, function(a, b) return a.distance < b.distance end) end
+    scanCost = (os.clock() - started) * 1000
+end
+local function aimCamera(dt)
+    if not alive or not CFG.camLock or not cameraAllowed() then return end
+    local now, target = os.clock(), aimTarget
+    if not usable(target, CFG.aimRange, now) then return end
+    local eye = eyePosition()
+    if not eye or not finite(Controller.yaw) or not finite(Controller.pitch) then return end
+    local delta = aimPoint(target, true) - eye
+    if delta.Magnitude < 0.001 then return end
+    local yaw = math.atan2(-delta.X, -delta.Z)
+    local pitch = math.atan2(delta.Y, math.sqrt(delta.X * delta.X + delta.Z * delta.Z))
+    local alpha = 1 - math.exp(-math.clamp(dt, 0, 0.1) * (21 - CFG.camSmooth) * 1.2)
+    local difference = (yaw - Controller.yaw + math.pi) % (2 * math.pi) - math.pi
+    Controller.yaw = (Controller.yaw + difference * alpha + math.pi) % (2 * math.pi) - math.pi
+    Controller.pitch = math.clamp(Controller.pitch + (pitch - Controller.pitch) * alpha, -math.pi / 2 + 0.001, math.pi / 2 - 0.001)
+end
+local function doKillaura(now)
+    if not CFG.killaura or not combatAllowed() or totTransaction then return end
+    if now - lastAttack < CFG.attackInterval or not usable(auraTarget, CFG.range, now) then return end
+    local okMode, mode = pcall(Hands.gamemode)
+    if okMode and mode == "spectator" then return end
+    local okStrength, strength = pcall(Hands.strength)
+    if not okStrength or not finite(strength) or strength < 0.95 then return end
+    local eye = eyePosition()
+    if not eye then return end
+    local delta = aimPoint(auraTarget, false) - eye
+    if delta.Magnitude < 0.001 or delta.Magnitude > CFG.range + 0.2 then return end
+    local state = snapshot(delta.Unit)
+    if not state then return end
+    lastAttack = now -- Bound retries even if the transport throws.
+    -- Use the captured original while silent aim is active, preserving aura selection.
+    local send = (wrappedSend and Net.send == wrappedSend) and originalSend or Net.send
+    local ok = pcall(send, {a = "attack", target = auraTarget.id, st = state})
+    if ok then Hands.attackReset = Controller.tickCount; Hands.swing = now end
+end
+
+-- A scoped table-function wrapper, never a global namecall/raycast hook.
+-- Only the supplied MC melee packet shape is supported.
+syncSilent = function()
+    if not CFG.silentAim then
+        if wrappedSend and Net.send == wrappedSend then pcall(function() Net.send = originalSend end) end
+        wrappedSend, originalSend = nil, nil
+        return true
+    end
+    if wrappedSend then
+        if Net.send == wrappedSend then return true end
+        report("Net.send changed; silent aim disabled to preserve the newer wrapper.")
+        CFG.silentAim = false; wrappedSend, originalSend = nil, nil
+        return false
+    end
+    local base = Net.send
+    local random = Random.new()
+    local wrapper = function(packet, ...)
+        if alive and CFG.silentAim and combatAllowed() and type(packet) == "table"
+            and packet.a == "attack" and type(packet.st) == "table" and vector(packet.st.look)
+            and usable(silentTarget, CFG.silentRange, os.clock()) and random:NextNumber(0, 100) < CFG.silentChance then
+            local eye = eyePosition()
+            if eye then
+                local delta = aimPoint(silentTarget, true) - eye
+                if delta.Magnitude > 0.001 and delta.Magnitude <= CFG.silentRange + 0.2 then
+                    local copy = table.clone(packet)
+                    copy.st = table.clone(packet.st)
+                    copy.target, copy.st.look = silentTarget.id, delta.Unit
+                    return base(copy, ...)
+                end
+            end
+        end
+        return base(packet, ...)
+    end
+    local ok = pcall(function() Net.send = wrapper end)
+    if not ok or Net.send ~= wrapper then
+        CFG.silentAim = false; report("Silent aim unavailable: MC.Net.send is not writable.")
+        return false
+    end
+    originalSend, wrappedSend = base, wrapper
+    return true
+end
+
+-- Inventory work is a heartbeat state machine: no spawned retry threads.
+local TOTEM_ID = "totem_of_undying"
+local function itemId(item) return type(item) == "table" and item.id or nil end
+local function clickSlot(slot) return pcall(Net.send, {a = "inv", op = "click", slot = slot, right = false, shift = false}) end
+local function finishTransaction()
+    local transaction, inv = totTransaction, Hands.inv
+    if transaction and inv and inv.cursor then
+        local owned = inv.cursor == transaction.ownedCursor
+            or (transaction.phase == "pickup" and itemId(inv.cursor) == TOTEM_ID)
+            or (transaction.phase == "place" and transaction.previousOffhand ~= nil and inv.cursor == transaction.previousOffhand)
+        if owned then clickSlot(transaction.slot) end
+    end
+    totTransaction = nil
+end
+local function ensureTotem(now)
+    local inv = Hands.inv
+    if totTransaction then
+        local transaction = totTransaction
+        if not inv then totTransaction = nil; return end
+        if now > transaction.deadline then finishTransaction(); return end
+        if now < transaction.next then return end
+        if transaction.phase == "pickup" then
+            if itemId(inv.cursor) ~= TOTEM_ID then return end
+            transaction.ownedCursor = inv.cursor
+            if not clickSlot(10) then finishTransaction(); return end
+            transaction.phase, transaction.next = "place", now + 0.12
+        elseif transaction.phase == "place" then
+            if itemId(inv.offhand) ~= TOTEM_ID then return end
+            if inv.cursor then
+                transaction.ownedCursor = inv.cursor
+                clickSlot(transaction.slot)
+            end
+            totTransaction = nil
+        end
+        return
+    end
+    if not CFG.autoTotem or not combatAllowed() or not inv or now - lastTotem < 0.2 then return end
+    lastTotem = now
+    if itemId(inv.offhand) == TOTEM_ID or inv.cursor then return end
+    local hp = player:GetAttribute("Health")
+    if inv.offhand and (not finite(hp) or hp > CFG.totemHealth) then return end
+    for slot = 1, 9 do
+        if inv.hotbar and itemId(inv.hotbar[slot]) == TOTEM_ID then
+            if inv.selected ~= slot then pcall(Hands.select, slot); return end
+            if type(Hands.stopUsing) == "function" then pcall(Hands.stopUsing, false) end
+            local oldOffhand, current = inv.offhand, inv.hotbar[slot]
+            inv.hotbar[slot], inv.offhand = oldOffhand, current
+            if not pcall(Net.send, {a = "swap"}) then
+                inv.hotbar[slot], inv.offhand = current, oldOffhand
+            else Hands.attackReset = Controller.tickCount end
+            return
+        end
+    end
+    local selected
+    for index, item in pairs(inv.inventory or {}) do
+        if type(index) == "number" and index >= 1 and index % 1 == 0 and itemId(item) == TOTEM_ID
+            and (not selected or index < selected) then selected = index end
+    end
+    if selected then
+        local slot = selected + 10
+        if clickSlot(slot) then
+            totTransaction = {slot = slot, phase = "pickup", previousOffhand = inv.offhand, next = now + 0.12, deadline = now + 1.2}
+        end
+    end
+end
+
+-- ESP objects are pooled by display slot. No instance creation in the render loop.
+local espPool = {}
+local function buildEspSlot()
+    local root = make("Frame", {BackgroundTransparency = 1, Visible = false, Size = UDim2.fromOffset(1, 1)}, espLayer)
+    local box = make("Frame", {BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1)}, root)
+    local stroke = make("UIStroke", {Thickness = 1.2, ApplyStrokeMode = Enum.ApplyStrokeMode.Border}, box)
+    local segments = {}
+    for index = 1, 8 do
+        segments[index] = make("Frame", {}, root)
+    end
+    local name = make("TextLabel", {BackgroundTransparency = 1, Position = UDim2.new(0.5, -90, 0, -19),
+        Size = UDim2.fromOffset(180, 17), Font = Enum.Font.GothamMedium, TextSize = 11,
+        TextColor3 = Color3.new(1, 1, 1), TextStrokeTransparency = 0.3}, root)
+    local details = make("TextLabel", {BackgroundTransparency = 1, Position = UDim2.new(0.5, -85, 1, 3),
+        Size = UDim2.fromOffset(170, 16), Font = Enum.Font.Code, TextSize = 10,
+        TextColor3 = Color3.new(1, 1, 1), TextStrokeTransparency = 0.3}, root)
+    local healthBg = make("Frame", {Position = UDim2.fromOffset(-6, 0), Size = UDim2.new(0, 3, 1, 0), BackgroundColor3 = Color3.fromRGB(25, 25, 28)}, root)
+    local healthFill = make("Frame", {AnchorPoint = Vector2.new(0, 1), Position = UDim2.fromScale(0, 1), Size = UDim2.fromScale(1, 1)}, healthBg)
+    local tracer = make("Frame", {AnchorPoint = Vector2.new(0.5, 0.5), Visible = false}, espLayer)
+    return {root = root, box = box, stroke = stroke, segments = segments, name = name,
+        details = details, healthBg = healthBg, healthFill = healthFill, tracer = tracer, textAt = 0}
+end
+local function resizePool()
+    local limit = CFG.esp and math.floor(CFG.espLimit) or 0
+    while #espPool < limit do espPool[#espPool + 1] = buildEspSlot() end
+    while #espPool > limit do
+        local slot = table.remove(espPool); slot.root:Destroy(); slot.tracer:Destroy()
+    end
+end
+local function hideEsp()
+    for _, slot in ipairs(espPool) do slot.root.Visible = false; slot.tracer.Visible = false end
+end
+local function bounds(camera, eye, record)
+    local top = project(camera, eye, record.feet + Vector3.new(0, record.height, 0))
+    local bottom = project(camera, eye, record.feet)
+    if top.Z <= 0.05 or bottom.Z <= 0.05 then return nil end
+    local centre = (top + bottom) * 0.5
+    local side = project(camera, eye, record.feet + Vector3.new(0, record.height * 0.5, 0) + camera.CFrame.RightVector * (record.width * 0.5))
+    local halfWidth = math.max(2, math.abs(side.X - centre.X))
+    local left, right = math.min(top.X, bottom.X) - halfWidth, math.max(top.X, bottom.X) + halfWidth
+    local upper, lower = math.min(top.Y, bottom.Y), math.max(top.Y, bottom.Y)
+    local viewport = camera.ViewportSize
+    if right < 0 or left > viewport.X or lower < 0 or upper > viewport.Y or lower - upper < 2 then return nil end
+    if right - left > viewport.X * 2 or lower - upper > viewport.Y * 2 then return nil end
+    return left, upper, right - left, lower - upper
+end
+local function drawEsp(now)
+    local started = os.clock()
+    local camera, eye = workspace.CurrentCamera, eyePosition()
+    if not CFG.esp or not camera or not eye or now - lastScan > 0.3 then hideEsp(); return end
+    local used = 0
+    for _, record in ipairs(candidates) do
+        if used >= #espPool then break end
+        if usable(record, CFG.espRange, now) then
+            local x, y, width, height = bounds(camera, eye, record)
+            if x then
+                used = used + 1
+                local slot = espPool[used]
+                slot.root.Visible = true
+                slot.root.Position = UDim2.fromOffset(math.floor(x), math.floor(y))
+                slot.root.Size = UDim2.fromOffset(math.floor(width), math.floor(height))
+                local tint = (record == aimTarget or record == auraTarget or record == silentTarget) and theme.text or theme.accent
+                local fade = CFG.espFade and math.clamp(record.distance / CFG.espRange * 0.65, 0, 0.65) or 0
+                slot.box.Visible = CFG.espBoxes and not CFG.espCorners
+                slot.stroke.Color, slot.stroke.Transparency = tint, fade
+                for index, segment in ipairs(slot.segments) do
+                    segment.Visible = CFG.espBoxes and CFG.espCorners
+                    if segment.Visible then
+                        local corner = math.floor((index - 1) / 2)
+                        local rightSide, bottomSide = corner % 2 == 1, corner >= 2
+                        segment.AnchorPoint = Vector2.new(rightSide and 1 or 0, bottomSide and 1 or 0)
+                        segment.Position = UDim2.fromScale(rightSide and 1 or 0, bottomSide and 1 or 0)
+                        segment.Size = index % 2 == 1 and UDim2.new(0.25, 0, 0, 1) or UDim2.new(0, 1, 0.22, 0)
+                        segment.BackgroundColor3, segment.BackgroundTransparency = tint, fade
+                    end
+                end
+                slot.name.Visible = CFG.espNames
+                slot.name.TextTransparency, slot.details.TextTransparency = fade, fade
+                local validHealth = CFG.espHealth and finite(record.health)
+                local validBar = validHealth and finite(record.maxHealth) and record.maxHealth > 0
+                slot.healthBg.Visible = validBar == true
+                if validBar then
+                    local ratio = math.clamp(record.health / record.maxHealth, 0, 1)
+                    slot.healthFill.Size = UDim2.fromScale(1, ratio)
+                    slot.healthFill.BackgroundColor3 = Color3.fromHSV(ratio * 0.33, 0.7, 0.95)
+                end
+                slot.details.Visible = CFG.espDistance or validHealth == true
+                if slot.id ~= record.id or now - slot.textAt >= 0.2 then
+                    slot.id, slot.textAt = record.id, now
+                    slot.name.Text = record.name
+                    local distance = CFG.espDistance and string.format("%.1f blocks", record.distance) or ""
+                    slot.details.Text = distance .. (validHealth and string.format("%s%.0f HP", distance ~= "" and "  /  " or "", record.health) or "")
+                end
+                slot.tracer.Visible = CFG.espTracers
+                if CFG.espTracers then
+                    local origin = Vector2.new(camera.ViewportSize.X * 0.5, camera.ViewportSize.Y - 12)
+                    local endpoint = Vector2.new(x + width * 0.5, y + height)
+                    local delta = endpoint - origin
+                    slot.tracer.Position = UDim2.fromOffset((origin.X + endpoint.X) * 0.5, (origin.Y + endpoint.Y) * 0.5)
+                    slot.tracer.Size = UDim2.fromOffset(delta.Magnitude, 1)
+                    slot.tracer.Rotation = math.deg(math.atan2(delta.Y, delta.X))
+                    slot.tracer.BackgroundColor3, slot.tracer.BackgroundTransparency = tint, math.max(0.3, fade)
+                end
+            end
+        end
+    end
+    for index = used + 1, #espPool do espPool[index].root.Visible = false; espPool[index].tracer.Visible = false end
+    espCost = (os.clock() - started) * 1000
+end
+
+local function fitWindow()
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+    local view = camera.ViewportSize
+    scale.Scale = math.max(0.2, math.min(CFG.uiScale, (view.X - 24) / 900, (view.Y - 48) / 596))
+    local position = window.AbsolutePosition
+    window.Position = UDim2.fromOffset(math.clamp(position.X, 8, math.max(8, view.X - 900 * scale.Scale - 8)),
+        math.clamp(position.Y, 8, math.max(8, view.Y - 596 * scale.Scale - 8)))
+end
+local function setMenu(visible)
+    menuOpen, window.Visible = visible, visible
+    if not visible then capture, sliderDrag, windowDrag = nil, nil, nil end
+    refreshAll()
+end
+setOption = function(key, value)
+    if not alive or defaults[key] == nil then return end
+    mergeSettings({[key] = value})
+    if key == "theme" then applyTheme() end
+    if key == "uiScale" then fitWindow() end
+    if key == "silentAim" then syncSilent() end
+    if key == "esp" or key == "espLimit" then resizePool() end
+    if key == "camLock" and not CFG.camLock then aimTarget = nil; api.targetId = nil end
+    if key == "killaura" and not CFG.killaura then auraTarget = nil end
+    if key == "autoTotem" and not CFG.autoTotem then finishTransaction() end
+    for _, slot in ipairs(espPool) do slot.textAt = 0 end
+    refreshAll()
+end
+local function settingsSnapshot()
+    local values = {}
+    for key in pairs(defaults) do values[key] = CFG[key] end
+    return {version = 2, settings = values, binds = table.clone(binds)}
+end
+local function loadProfile(data)
+    if type(data) ~= "table" or data.version ~= 2 or type(data.settings) ~= "table" then return false end
+    mergeSettings(data.settings)
+    if type(data.binds) == "table" then
+        local nextBinds, used = {}, {}
+        -- Reserve the menu first; malformed duplicate bindings fall back to unbound.
+        local menu = validKey(data.binds.menu) and data.binds.menu or "RightShift"
+        nextBinds.menu, used[menu] = menu, true
+        for _, key in ipairs({"killaura", "autoTotem", "camLock", "silentAim", "esp"}) do
+            local value = data.binds[key]
+            if validKey(value) and not used[value] then nextBinds[key], used[value] = value, true
+            else nextBinds[key] = "None" end
+        end
+        for key, value in pairs(nextBinds) do binds[key] = value end
+    end
+    syncSilent(); resizePool(); applyTheme(); fitWindow(); refreshAll()
+    return true
+end
+local PROFILE_FILE = "unstable-smp-v2.json"
+local function saveProfile()
+    local data = settingsSnapshot()
+    env.UNSTABLE_SMP_PROFILE = data
+    if type(writefile) == "function" then
+        local ok = pcall(function() writefile(PROFILE_FILE, HttpService:JSONEncode(data)) end)
+        report(ok and "Profile saved to unstable-smp-v2.json" or "Disk save failed; profile kept for this session.")
+    else report("Profile saved for this session; file APIs unavailable.") end
+end
+local function restoreProfile()
+    local data = env.UNSTABLE_SMP_PROFILE
+    if type(readfile) == "function" then
+        local ok, decoded = pcall(function()
+            local raw = readfile(PROFILE_FILE)
+            assert(#raw < 100000, "Profile too large")
+            return HttpService:JSONDecode(raw)
+        end)
+        if ok then data = decoded end
+    end
+    report(loadProfile(data) and "Profile loaded." or "No compatible saved profile found.")
+end
+
+do
+    local aura = card(pages.Combat, "Killaura", "Nearest target. Existing strength gate and attack packet preserved.", "swords")
+    toggle(aura, "Enable killaura", "killaura")
+    slider(aura, "Reach / blocks", "range", 1, 6, 0.1, "%.1f")
+    slider(aura, "Attack interval / seconds", "attackInterval", 0.05, 0.5, 0.01, "%.2f")
+    slider(aura, "Attack cone / degrees", "auraFov", 30, 360, 5, "%.0f")
+    local aim = card(pages.Combat, "Aimbot", "Stable target selection with frame-rate independent camera smoothing.", "crosshair")
+    toggle(aim, "Enable aimbot", "camLock")
+    toggle(aim, "Hold right mouse to aim", "aimHold")
+    toggle(aim, "Prefer current target", "aimSticky")
+    choice(aim, "Aim point", "aimPart", {"Chest", "Head"})
+    slider(aim, "Aim range / blocks", "aimRange", 2, 100, 1, "%.0f")
+    slider(aim, "FOV radius / pixels", "aimFov", 30, 400, 5, "%.0f")
+    slider(aim, "Smoothing / higher is softer", "camSmooth", 1, 20, 1, "%.0f")
+    slider(aim, "Velocity lead / seconds", "prediction", 0, 0.2, 0.01, "%.2f")
+    toggle(aim, "Show aim FOV", "showFov")
+    local silent = card(pages.Combat, "Silent aim", "Redirects MC melee attack packets. Your camera stays unchanged.", "mouse-pointer-2")
+    toggle(silent, "Enable silent aim", "silentAim")
+    slider(silent, "Silent reach / blocks", "silentRange", 1, 6, 0.1, "%.1f")
+    slider(silent, "Redirect chance / percent", "silentChance", 0, 100, 1, "%.0f%%")
+end
+do
+    local esp = card(pages.Visuals, "Entity ESP", "Pooled overlays. Nearest entities first. Health shown when supplied.", "eye")
+    toggle(esp, "Enable ESP", "esp")
+    toggle(esp, "Bounding boxes", "espBoxes")
+    toggle(esp, "Corner box style", "espCorners")
+    toggle(esp, "Entity names", "espNames")
+    toggle(esp, "Distance labels", "espDistance")
+    toggle(esp, "Health bars / values", "espHealth")
+    toggle(esp, "Screen-bottom tracers", "espTracers")
+    toggle(esp, "Fade distant entities", "espFade")
+    slider(esp, "Maximum distance / blocks", "espRange", 10, 300, 5, "%.0f")
+    slider(esp, "Maximum visible entities", "espLimit", 4, 64, 1, "%.0f")
+    slider(esp, "Overlay refresh / Hz", "espHz", 10, 60, 5, "%.0f")
+    local hud = card(pages.Visuals, "Overlay", "Small status elements outside the menu.", "zap")
+    toggle(hud, "Watermark / click to open", "watermark")
+    toggle(hud, "Enabled module list", "moduleList")
+end
+do
+    local utility = card(pages.Utility, "Auto totem", "Hotbar first, then inventory. Waits for inventory confirmation.", "shield")
+    toggle(utility, "Enable auto totem", "autoTotem")
+    slider(utility, "Replace offhand below HP", "totemHealth", 1, 20, 1, "%.0f")
+    local session = card(pages.Utility, "Session", "Unload disconnects input, render work, and this script's send wrapper.", "power")
+    action(session, "Hide menu", "Hide", function() setMenu(false) end)
+    action(session, "Remove UI and features", "Unload", function() destroyed() end)
+end
+do
+    local themeCard = card(pages.Themes, "Color studio", "Six palettes. Every control follows your selected theme.", "palette")
+    for _, name in ipairs({"Amethyst", "Mint", "Glacier", "Rose", "Ember", "Graphite"}) do
+        local frame = row(themeCard, name, 47)
+        for i, key in ipairs({"bg", "card", "accent", "text"}) do
+            local swatch = make("Frame", {Size = UDim2.fromOffset(17, 17), Position = UDim2.new(1, -232 + (i - 1) * 24, 0, 14),
+                BackgroundColor3 = color(themes[name][key])}, frame)
+            round(swatch, 5)
+        end
+        local pick = button(frame, "Apply", UDim2.new(1, -120, 0, 8), UDim2.fromOffset(117, 30))
+        listen(pick.Activated, function() setOption("theme", name) end)
+        observer(function()
+            pick.Text = CFG.theme == name and "Selected" or "Apply"
+            if theme then pick.TextColor3 = CFG.theme == name and theme.accent or theme.muted end
+        end)
+    end
+    local appearance = card(pages.Themes, "Interface", "Automatically fits smaller screens. Drag the page title to move.", "settings-2")
+    slider(appearance, "UI scale", "uiScale", 0.7, 1.2, 0.05, "%.2fx")
+end
+local bindNames = {menu = "Toggle menu", killaura = "Killaura", autoTotem = "Auto totem", camLock = "Aimbot", silentAim = "Silent aim", esp = "ESP"}
+do
+    local keys = card(pages.Keybinds, "Keyboard", "Escape cancels. Backspace clears a feature binding. Menu stays bound.", "keyboard")
+    for _, key in ipairs({"menu", "killaura", "autoTotem", "camLock", "silentAim", "esp"}) do
+        local control = action(keys, bindNames[key], "", function() capture = key; refreshAll() end)
+        observer(function()
+            control.Text = capture == key and "Press a key..." or binds[key]
+            if theme then control.TextColor3 = capture == key and theme.accent or theme.text end
+        end)
+    end
+    action(keys, "Restore default bindings", "Reset keys", function()
+        capture = nil
+        for key, value in pairs(bindDefaults) do binds[key] = value end
+        refreshAll(); report("Default keybinds restored.")
+    end)
+end
+do
+    local performance = card(pages.Settings, "Performance", "Aim runs per frame; target discovery and ESP use separate budgets.", "zap")
+    slider(performance, "Shared target refresh / Hz", "scanHz", 5, 30, 1, "%.0f")
+    action(performance, "Apply a lighter rendering budget", "Low overhead", function()
+        CFG.espLimit, CFG.espHz, CFG.scanHz, CFG.espTracers = 16, 20, 15, false
+        resizePool(); refreshAll(); report("Budget set: 16 overlays / 20 Hz ESP / 15 Hz targets.")
+    end)
+    toggle(performance, "Pause combat while menu is open", "pauseOnMenu")
+    local profiles = card(pages.Settings, "Profile", "Saves settings, palette, and keybinds. Load is always explicit.", "settings-2")
+    action(profiles, "Store the current setup", "Save profile", saveProfile)
+    action(profiles, "Restore the saved setup", "Load profile", restoreProfile)
+    action(profiles, "Return to default settings", "Reset settings", function()
+        finishTransaction()
+        for key, value in pairs(defaults) do CFG[key] = value end
+        syncSilent(); resizePool(); applyTheme(); fitWindow(); refreshAll(); report("Settings reset; features are off.")
+    end)
+end
+
+observer(function()
+    menuHint.Text = string.upper(binds.menu) .. "  /  TOGGLE MENU"
+    mark.Visible, activeList.Visible = CFG.watermark, CFG.moduleList
+    local names = {}
+    for _, key in ipairs({"killaura", "camLock", "silentAim", "autoTotem", "esp"}) do
+        if CFG[key] then names[#names + 1] = bindNames[key] .. (binds[key] ~= "None" and "  [" .. binds[key] .. "]" or "") end
+    end
+    activeList.Text = table.concat(names, "\n\n")
+end)
+
+destroyed = function()
+    if not alive then return end
+    alive = false
+    finishTransaction()
+    if wrappedSend and Net.send == wrappedSend then pcall(function() Net.send = originalSend end) end
+    wrappedSend, originalSend = nil, nil
+    pcall(function() RunService:UnbindFromRenderStep(CAMERA_BIND) end)
+    for _, connection in ipairs(connections) do connection:Disconnect() end
+    table.clear(connections); table.clear(cache); table.clear(candidates); table.clear(espPool)
+    table.clear(refreshers); table.clear(themed)
+    pcall(function() gui:Destroy() end)
+    if env.UNSTABLE_SMP == api then env.UNSTABLE_SMP = nil end
+    if env.UNSTABLE_SMP_CFG == CFG then env.UNSTABLE_SMP_CFG = nil end
+end
+api.destroy, api.set, api.setMenu = destroyed, setOption, setMenu
+api.saveProfile, api.loadProfile = saveProfile, restoreProfile
+api.stats = function() return {targets = count, scanMs = scanCost, espMs = espCost,
+    overlaySlots = #espPool, targetId = api.targetId, lastError = lastError, menuOpen = menuOpen} end
+env.UNSTABLE_SMP = api
+
+listen(close.Activated, function() setMenu(false) end)
+listen(mark.Activated, function() setMenu(not menuOpen) end)
+listen(UIS.TextBoxFocused, function() typing = true; rightHeld = false end)
+listen(UIS.TextBoxFocusReleased, function() typing = false end)
+listen(UIS.WindowFocusReleased, function() rightHeld = false; sliderDrag, windowDrag = nil, nil end)
+listen(UIS.InputBegan, function(input, gameProcessed)
+    if not alive or typing or UIS:GetFocusedTextBox() then return end
+    if capture then
+        local name = input.KeyCode.Name
+        if name == "Unknown" then return end
+        if name == "Escape" then capture = nil; refreshAll(); return end
+        if name == "Backspace" or name == "Delete" then
+            if capture == "menu" then report("The menu needs a keybind.")
+            else binds[capture] = "None"; capture = nil end
+            refreshAll(); return
+        end
+        for key, value in pairs(binds) do
+            if key ~= capture and value == name then report(name .. " is already bound to " .. bindNames[key] .. "."); return end
+        end
+        binds[capture] = name; capture = nil; refreshAll(); return
+    end
+    -- Menu remains reachable even if a game consumes its key, except while typing.
+    if input.KeyCode.Name == binds.menu then setMenu(not menuOpen); return end
+    if gameProcessed then return end
+    if input.UserInputType == Enum.UserInputType.MouseButton2 then rightHeld = true end
+    for key, value in pairs(binds) do
+        if key ~= "menu" and value ~= "None" and input.KeyCode.Name == value then
+            setOption(key, not CFG[key]); report(bindNames[key] .. (CFG[key] and " enabled" or " disabled")); break
+        end
+    end
+end)
+listen(top.InputBegan, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        windowDrag = {input = input, start = input.Position, position = window.AbsolutePosition}
+    end
+end)
+listen(UIS.InputChanged, function(input)
+    local pointer = input.UserInputType == Enum.UserInputType.MouseMovement
+    if sliderDrag and (pointer or input == sliderDrag.input) then sliderDrag.update(input.Position.X) end
+    if windowDrag and (pointer or input == windowDrag.input) then
+        local delta = input.Position - windowDrag.start
+        window.Position = UDim2.fromOffset(windowDrag.position.X + delta.X, windowDrag.position.Y + delta.Y)
+        fitWindow()
+    end
+end)
+listen(UIS.InputEnded, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton2 then rightHeld = false end
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then sliderDrag, windowDrag = nil, nil end
+    if sliderDrag and input == sliderDrag.input then sliderDrag = nil end
+    if windowDrag and input == windowDrag.input then windowDrag = nil end
+end)
+listen(player.CharacterRemoving, function()
+    aimTarget, auraTarget, silentTarget = nil, nil, nil
+    api.targetId = nil; table.clear(candidates); table.clear(cache); count = 0; hideEsp()
+    finishTransaction(); rightHeld = false
+end)
+listen(gui.Destroying, destroyed)
+
+local errors, errorTimes = {}, {}
+local function guarded(name, fn, arg)
+    local ok, message = pcall(fn, arg)
+    if ok then errors[name] = 0; return end
+    errors[name] = (errors[name] or 0) + 1
+    local now = os.clock()
+    if now - (errorTimes[name] or -10) > 5 then
+        errorTimes[name] = now
+        report(name .. ": " .. tostring(message))
+        warn("UNSTABLE / " .. name .. ": " .. tostring(message))
+    end
+    if errors[name] >= 3 then
+        if name == "Aimbot" then CFG.camLock = false; aimTarget = nil
+        elseif name == "ESP" then CFG.esp = false; hideEsp()
+        elseif name == "Killaura" then CFG.killaura = false
+        elseif name == "Totem" then CFG.autoTotem = false; finishTransaction()
+        elseif name == "Targets" then
+            CFG.camLock, CFG.killaura, CFG.silentAim, CFG.esp = false, false, false, false
+            aimTarget, auraTarget, silentTarget = nil, nil, nil
+            syncSilent(); hideEsp()
+        end
+        refreshAll()
+    end
+end
+local scanClock, espClock, statusClock, fpsClock, frames = 0, 0, 0, 0, 0
+local displayFps = 0
+listen(RunService.Heartbeat, function(dt)
+    if not alive then return end
+    local now = os.clock()
+    scanClock, statusClock = scanClock + dt, statusClock + dt
+    if scanClock >= 1 / CFG.scanHz then scanClock = 0; guarded("Targets", scanTargets, now) end
+    if CFG.autoTotem or totTransaction then guarded("Totem", ensureTotem, now) end
+    if CFG.killaura then guarded("Killaura", doKillaura, now) end
+    if statusClock >= 0.25 then
+        statusClock = 0
+        local health = player:GetAttribute("Health")
+        local hp = finite(health) and string.format("%.0f", health) or "?"
+        if menuOpen then
+            status.Text = string.format("HP %s   /   %d targets   /   scan %.2fms   /   ESP %.2fms   /   %d FPS", hp, count, scanCost, espCost, displayFps)
+            fitWindow()
+        end
+        if CFG.watermark then markStat.Text = string.format("%d FPS / v2", displayFps) end
+        if toast.Visible and now >= (toast:GetAttribute("Expires") or 0) then toast.Visible = false end
+        if CFG.silentAim and wrappedSend and Net.send ~= wrappedSend then syncSilent(); refreshAll() end
+    end
+end)
+RunService:BindToRenderStep(CAMERA_BIND, Enum.RenderPriority.Camera.Value - 1, function(dt)
+    if CFG.camLock then guarded("Aimbot", aimCamera, dt) end
+end)
+listen(RunService.RenderStepped, function(dt)
+    if not alive then return end
+    fpsClock, frames, espClock = fpsClock + dt, frames + 1, espClock + dt
+    if fpsClock >= 0.5 then displayFps = math.floor(frames / fpsClock + 0.5); fpsClock, frames = 0, 0 end
+    if CFG.esp and espClock >= 1 / CFG.espHz then espClock = 0; guarded("ESP", drawEsp, os.clock()) end
+    local camera = workspace.CurrentCamera
+    fov.Visible = camera ~= nil and CFG.showFov and (CFG.camLock or CFG.silentAim) and not menuOpen
+    if fov.Visible then
+        fov.Position = UDim2.fromOffset(camera.ViewportSize.X * 0.5, camera.ViewportSize.Y * 0.5)
+        fov.Size = UDim2.fromOffset(CFG.aimFov * 2, CFG.aimFov * 2)
+    end
+end)
+
+applyTheme(); resizePool(); selectTab("Combat"); fitWindow(); syncSilent(); refreshAll()
+report("UNSTABLE ready / " .. binds.menu .. " opens the menu.")
